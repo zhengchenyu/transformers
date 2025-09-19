@@ -3330,7 +3330,7 @@ class Trainer:
             self._rotate_checkpoints(use_mtime=True, output_dir=run_dir)
 
         if save_latest and self.is_world_process_zero():
-            with open(os.path.join(run_dir, 'latest'), 'w') as fd:
+            with open(os.path.join(run_dir, "latest"), "w") as fd:
                 fd.write(checkpoint_folder)
 
     def _save_rng_state(self, output_dir):

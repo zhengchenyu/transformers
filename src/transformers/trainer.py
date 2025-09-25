@@ -2268,7 +2268,6 @@ class Trainer:
         return self._train_batch_size * args.gradient_accumulation_steps * dp_world_size
 
     def update_gradient_accumulation_steps(self, args) -> int:
-        assert args.total_train_batch_size > 0, "total_train_batch_size must be > 0 to update grad_accum_steps"
         dp_world_size = args.world_size // self.get_tp_size()
 
         if (
@@ -2319,7 +2318,7 @@ class Trainer:
         # number of training epochs: num_train_epochs
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
-        if args.total_train_batch_size > 0:
+        if not args.deepspeed and args.total_train_batch_size > 0:
             self.update_gradient_accumulation_steps(args)
         total_train_batch_size = self.get_total_train_batch_size(args)
 

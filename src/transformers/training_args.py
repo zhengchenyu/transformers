@@ -337,6 +337,18 @@ class TrainingArguments:
 
             </Tip>
 
+        record_step_timing (`bool`, *optional*, defaults to `False`):
+            Whether to record the pure training time for each step. When enabled, timing data will be saved to a JSON file
+            for statistical analysis and comparison. This records only the actual training step duration, excluding
+            checkpoint saving, evaluation, and other operations.
+        step_timing_output_file (`str`, *optional*, defaults to `"step_timings.json"`):
+            Path to save the step timing data (in JSON format) when `record_step_timing` is enabled.
+        step_timing_log_steps (`int`, *optional*, defaults to `100`):
+            Print step timing statistics every N steps when `record_step_timing` is enabled. Set to 0 to disable
+            periodic statistics printing.
+        step_timing_verbose (`bool`, *optional*, defaults to `False`):
+            Whether to print timing information for every single step when `record_step_timing` is enabled.
+
         save_strategy (`str` or [`~trainer_utils.SaveStrategy`], *optional*, defaults to `"steps"`):
             The checkpoint save strategy to adopt during training. Possible values are:
 
@@ -986,6 +998,32 @@ class TrainingArguments:
         },
     )
     logging_nan_inf_filter: bool = field(default=True, metadata={"help": "Filter nan and inf losses for logging."})
+    record_step_timing: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to record the pure training time for each step. When enabled, timing data will be saved "
+                "to a JSON file for statistical analysis and comparison."
+            )
+        },
+    )
+    step_timing_output_file: str = field(
+        default="step_timings.json",
+        metadata={"help": "Path to save the step timing data (in JSON format) when record_step_timing is enabled."},
+    )
+    step_timing_log_steps: int = field(
+        default=100,
+        metadata={
+            "help": (
+                "Print step timing statistics every N steps when record_step_timing is enabled. "
+                "Set to 0 to disable periodic statistics printing."
+            )
+        },
+    )
+    step_timing_verbose: bool = field(
+        default=False,
+        metadata={"help": "Whether to print timing information for every single step when record_step_timing is enabled."},
+    )
     save_strategy: Union[SaveStrategy, str] = field(
         default="steps",
         metadata={"help": "The checkpoint save strategy to use."},
@@ -1574,6 +1612,40 @@ class TrainingArguments:
             )
         },
     )
+
+    profile_enable: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to enable profiling during training."
+            )
+        },
+    )
+
+    profile_mode: Optional[str] = field(
+        default="tensorboard",
+        metadata={
+            "help": "Whether or not to enable profiling during training.",
+            "choices": ["tensorboard", "chrome"],
+        },
+    )
+
+    profile_output_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The output directory for profile."
+        },
+    )
+
+    use_torchft: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to use torchft for model training."
+            )
+        },
+    )
+
 
     def __post_init__(self):
         # Set default output_dir if not provided

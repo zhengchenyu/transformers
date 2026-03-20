@@ -17,6 +17,7 @@ The Trainer class, to easily train a 🤗 Transformers from scratch or finetune 
 
 import contextlib
 import copy
+import dataclasses
 import functools
 import glob
 import importlib.metadata
@@ -32,9 +33,14 @@ import tempfile
 import time
 import warnings
 from collections.abc import Mapping
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+
+from torchft import ProcessGroupNCCL, ProcessGroupGloo, Manager, process_group
+from torchft.checkpointing.pg_transport import PGTransport
+from torchft.data import SkipDistributedSampler, DistributedBatchSampler
 
 from .data_loader import skip_first_batches
 
@@ -55,6 +61,7 @@ from huggingface_hub import ModelCard, create_repo, upload_folder
 from packaging import version
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
+from torch.distributed.distributed_c10d import ReduceOp
 
 from . import __version__
 from .configuration_utils import PretrainedConfig
@@ -89,6 +96,7 @@ from .trainer_callback import (
     TrainerControl,
     TrainerState,
 )
+from .trainer_step_timing import StepTimingCallback
 from .trainer_pt_utils import (
     DistributedTensorGatherer,
     EvalLoopContainer,
@@ -241,8 +249,8 @@ if is_accelerate_available():
         load_fsdp_model,
         load_fsdp_optimizer,
         save_fsdp_model,
-        save_fsdp_optimizer,
-    )
+        save_fsdp_optimizer, DeepSpeedOptimizerWrapper,
+)
 
     DATA_SAMPLERS = [RandomSampler]
     if version.parse(accelerate_version) > version.parse("1.3.0"):
@@ -315,6 +323,7 @@ SCALER_NAME = "scaler.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 FSDP_MODEL_NAME = "pytorch_model_fsdp"
+TORCH_FT_STATE_NAME = "torchft.pt"
 
 
 @requires(
@@ -691,6 +700,16 @@ class Trainer:
         )
         self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
+        # Add step timing callback if enabled
+        if self.args.record_step_timing:
+            self.add_callback(
+                StepTimingCallback(
+                    output_file=self.args.step_timing_output_file,
+                    log_every_n_steps=self.args.step_timing_log_steps,
+                    verbose=self.args.step_timing_verbose,
+                )
+            )
+
         # Will be set to True by `self._setup_loggers()` on first call to `self.log()`.
         self._loggers_initialized = False
 
@@ -816,6 +835,61 @@ class Trainer:
             num_devices = xr.global_runtime_device_count()
             xs.set_global_mesh(xs.Mesh(np.array(range(num_devices)), (num_devices, 1), axis_names=("fsdp", "tensor")))
         self.is_fsdp_xla_v1_enabled = self.is_fsdp_xla_enabled and not self.is_fsdp_xla_v2_enabled
+
+        if args.profile_enable:
+            assert args.profile_output_dir is not None
+            from accelerate import ProfileKwargs
+            from torch.profiler import tensorboard_trace_handler
+
+            if args.profile_mode == "tensorboard":
+                output_trace_dir = None
+                on_trace_ready = tensorboard_trace_handler(os.path.join(args.profile_output_dir, "tb_profiler"))
+            else:
+                output_trace_dir = os.path.join(args.profile_output_dir, "trace_profiler")
+                on_trace_ready = None
+
+            class ProfileCallback(TrainerCallback):
+
+                def __init__(self):
+                    self.profile_handler = ProfileKwargs(
+                        activities=["cpu", "cuda"],
+                        schedule_option={"wait": 5, "warmup": 1, "active": 3, "repeat": 2, "skip_first": 1},
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=True,
+                        with_flops=True,
+                        output_trace_dir=output_trace_dir,
+                        on_trace_ready=on_trace_ready,
+                    )
+
+                def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl,
+                                   **kwargs):
+                    self.profiler = self.profile_handler.build()
+                    self.profiler.start()
+
+                def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+                    if self.profile_handler.output_trace_dir is not None:
+                        os.makedirs(self.profile_handler.output_trace_dir, exist_ok=True)
+                        from accelerate.utils.constants import PROFILE_PATTERN_NAME
+                        self.profiler.export_chrome_trace(
+                            os.path.join(self.profile_handler.output_trace_dir,
+                                         PROFILE_PATTERN_NAME.format(suffix=args.process_index))
+                        )
+
+                    self.profiler.stop()
+
+                def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+                    self.profiler.step()
+
+                def on_substep_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+                    self.profiler.step()
+
+            self.add_callback(ProfileCallback())
+
+        if self.args.use_torchft:
+            self.ft_manager = self.init_ft_manager()
+            self.ft_replicate_pg = process_group.ManagedProcessGroup(self.ft_manager)
+
 
     @property
     def tokenizer(self) -> Optional[PreTrainedTokenizerBase]:
@@ -2216,6 +2290,9 @@ class Trainer:
             state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
             if state.train_batch_size is not None:
                 self._train_batch_size = state.train_batch_size
+            if self.args.use_torchft and os.path.exists(os.path.join(resume_from_checkpoint, TORCH_FT_STATE_NAME)):
+                ft_state_dict = torch.load(os.path.join(resume_from_checkpoint, TORCH_FT_STATE_NAME))
+                self.ft_manager.load_state_dict(ft_state_dict)
 
         # If model was re-initialized, put it on the right device and update self.model_wrapped
         if model_reloaded:
@@ -2291,6 +2368,8 @@ class Trainer:
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
+        if self.args.use_torchft:
+            return self._inner_training_loop_ft(batch_size, args, resume_from_checkpoint, trial, ignore_keys_for_eval)
         self.accelerator.free_memory()
         self._train_batch_size = batch_size
         if self.args.auto_find_batch_size:
@@ -2433,6 +2512,10 @@ class Trainer:
         # backward compatibility
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model_wrapped
+
+        if self.args.use_torchft:
+            assert self.is_deepspeed_enabled and self.deepspeed.zero_optimization_partition_weights(), \
+                "Only Deepspeed zero 3 is supported for FT integration."
 
         # ckpt loading
         if resume_from_checkpoint is not None:
@@ -3167,6 +3250,11 @@ class Trainer:
             # all_gather + mean() to get average loss over all processes
             tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
 
+            if self.args.use_torchft:
+                loss_tensor = torch.tensor(tr_loss_scalar, device=tr_loss.device)
+                self.ft_manager.allreduce(loss_tensor).wait()
+                tr_loss_scalar = loss_tensor.item()
+
             # reset tr_loss to zero
             tr_loss -= tr_loss
 
@@ -3193,8 +3281,9 @@ class Trainer:
                 self.control.should_save = is_new_best_metric
 
         if self.control.should_save:
-            self._save_checkpoint(model, trial)
-            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            if not self.args.use_torchft or (self.args.use_torchft and self.ft_manager.participating_rank() == 0):
+                self._save_checkpoint(model, trial)
+                self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def _load_rng_state(self, checkpoint):
         # Load RNG states from `checkpoint`
@@ -3319,6 +3408,9 @@ class Trainer:
                 else:
                     self.state.stateful_callbacks[cb_name] = cb_state
             self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+            if self.args.use_torchft:
+                ft_state_dict = self.ft_manager.state_dict()
+                torch.save(ft_state_dict, os.path.join(output_dir, TORCH_FT_STATE_NAME))
 
         if self.args.push_to_hub:
             self._push_from_checkpoint(output_dir)
@@ -3879,14 +3971,21 @@ class Trainer:
         else:
             # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
             if not self.model_accepts_loss_kwargs and self.compute_loss_func is None:
-                loss = loss / self.args.gradient_accumulation_steps
+                if self.args.use_torchft:
+                    loss = loss / self.args.gradient_accumulation_steps_per_replica_group
+                else:
+                    loss = loss / self.args.gradient_accumulation_steps
 
             # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
             # https://github.com/huggingface/transformers/pull/35808
             if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                 kwargs["scale_wrt_gas"] = False
 
-            self.accelerator.backward(loss, **kwargs)
+            if self.args.use_torchft and self.is_deepspeed_enabled:
+                # For torchft with deepspeed, we only need to use deepspeed engine backward, but not do optimizer step
+                self.deepspeed.backward(loss, **kwargs)
+            else:
+                self.accelerator.backward(loss, **kwargs)
 
             return loss.detach()
 
@@ -5414,7 +5513,13 @@ class Trainer:
         max_steps = args.max_steps
         # If max_steps is negative, we use the number of epochs to determine the number of total steps later
         epoch_based = max_steps < 0
-        len_dataloader = len(dataloader) if has_length(dataloader) else None
+
+        len_dataloader = None
+        if has_length(dataloader):
+            if self.args.use_torchft:
+                len_dataloader = self.num_examples(dataloader) // self.args.total_train_batch_size
+            else:
+                len_dataloader = len(dataloader)
 
         # Case 2: We have a dataloader length and can extrapolate
         if len_dataloader is not None:
@@ -5460,3 +5565,848 @@ class Trainer:
             len_dataloader,
             max_steps,
         )
+
+    def init_ft_manager(self):
+        if torch.cuda.is_available():
+            pg = ProcessGroupNCCL(timeout=timedelta(seconds=30))
+        else:
+            pg = ProcessGroupGloo(timeout=timedelta(seconds=5))
+        transport = PGTransport(
+            pg,
+            timeout=timedelta(seconds=10),
+            device=(
+                "cuda"
+                if torch.cuda.is_available()
+                else "xpu"
+                if torch.xpu.is_available()
+                else "cpu"
+            ),
+        )
+        REPLICA_GROUP_ID = int(os.environ.get("REPLICA_GROUP_ID", 0))
+        manager = Manager(
+            pg=pg,
+            min_replica_size=1,
+            load_state_dict=None,
+            state_dict=None,
+            replica_id=f"train_ddp_{REPLICA_GROUP_ID}",
+            timeout=timedelta(seconds=30),
+            checkpoint_transport=transport,
+            dataloader_fn=partial(get_train_dataloader_ft, self),
+        )
+        return manager
+
+    def _save_rng_state_to_memory(self):
+        # Save RNG state in non-distributed training
+        rng_states = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cpu": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                # In non distributed, we save the global CUDA RNG state (will take care of DataParallel)
+                rng_states["cuda"] = torch.cuda.random.get_rng_state_all()
+            else:
+                rng_states["cuda"] = torch.cuda.random.get_rng_state()
+
+        if is_torch_xla_available():
+            rng_states["xla"] = xm.get_rng_state()
+
+        if is_torch_npu_available():
+            if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                rng_states["npu"] = torch.npu.random.get_rng_state_all()
+            else:
+                rng_states["npu"] = torch.npu.random.get_rng_state()
+
+        if is_torch_hpu_available():
+            if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                rng_states["hpu"] = torch.hpu.random.get_rng_state_all()
+            else:
+                rng_states["hpu"] = torch.hpu.random.get_rng_state()
+
+        if is_torch_mlu_available():
+            if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                rng_states["mlu"] = torch.mlu.random.get_rng_state_all()
+            else:
+                rng_states["mlu"] = torch.mlu.random.get_rng_state()
+
+        if is_torch_musa_available():
+            if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
+                rng_states["musa"] = torch.musa.get_rng_state_all()
+            else:
+                rng_states["musa"] = torch.musa.get_rng_state()
+
+        return rng_states
+
+    def _load_rng_state_from_memory(self, state_dict):
+        # Load RNG states from `checkpoint`
+        if state_dict is None:
+            return
+
+        random.setstate(state_dict["python"])
+        np.random.set_state(state_dict["numpy"])
+        torch.random.set_rng_state(state_dict["cpu"])
+        if is_torch_xla_available():
+            xm.set_rng_state(state_dict["xla"])
+
+        is_distributed = self.args.parallel_mode == ParallelMode.DISTRIBUTED
+        if torch.cuda.is_available():
+            set_rng_state_for_device("CUDA", torch.cuda, state_dict, is_distributed)
+        if is_torch_npu_available():
+            set_rng_state_for_device("NPU", torch.npu, state_dict, is_distributed)
+        if is_torch_hpu_available():
+            set_rng_state_for_device("HPU", torch.hpu, state_dict, is_distributed)
+        if is_torch_mlu_available():
+            set_rng_state_for_device("MLU", torch.mlu, state_dict, is_distributed)
+        if is_torch_musa_available():
+            set_rng_state_for_device("MUSA", torch.musa, state_dict, is_distributed)
+
+    def _ft_state_dict(self):
+        rank = dist.get_rank()
+        state_dict = {
+            "optim": {
+                rank: self.optimizer.optimizer.state_dict(),
+            },
+            "rng_state": {
+                rank: self._save_rng_state_to_memory(),
+            }
+        }
+        if self.lr_scheduler is not None:
+            state_dict["lr_scheduler"] = self.lr_scheduler.state_dict()
+        if self.accelerator.scaler is not None:
+            state_dict["scaler"] = self.accelerator.scaler,
+        print(f"Setup checkpoint to send!")
+        state_json = json.dumps(dataclasses.asdict(self.state), indent=2, sort_keys=True) + "\n"
+        state_dict["state"] = state_json
+        return state_dict
+
+    def _ft_load_state_dict(self, state_dict):
+        print(f"Received checkpoint!")
+        self.optimizer.optimizer.load_state_dict(state_dict["optim"])
+        if "lr_scheduler" in state_dict:
+            self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+        if "scaler" in state_dict:
+            self.accelerator.scaler.load_state_dict(state_dict["scaler"])
+        self._load_rng_state_from_memory(state_dict["rng_state"][dist.get_rank()])
+        self.ft_rng_state = state_dict["rng_state"]
+        self.ft_rng_to_sync = True
+        if "state" in state_dict:
+            self.state = TrainerState(**json.loads(state_dict["state"]))
+        # Avoid to get wrong loss.
+        self._globalstep_last_logged = self.ft_manager.current_step()
+
+    # def dataloader_fn(self, replica_world_size, replica_rank, current_batches_committed):
+    #     assert ((self.args.gradient_accumulation_steps % replica_world_size) == 0), "Gradient accumulation steps must be divisible by replica world size."
+    #     self.args.gradient_accumulation_steps_per_replica_group = self.args.gradient_accumulation_steps // replica_world_size
+    #
+    #     sampler = SkipDistributedSampler(
+    #         dataset=self.train_dataset,
+    #         num_replicas=1,
+    #         rank=0,
+    #         shuffle=True,
+    #         seed=0,
+    #         drop_last=True,
+    #         skip_samples=current_batches_committed * self.args.per_device_train_batch_size * self.accelerator.num_processes,
+    #     )
+    #     batch_sampler = DistributedBatchSampler(
+    #         sampler=sampler,
+    #         batch_size=self.args.per_device_train_batch_size,
+    #         drop_last=True,
+    #         num_replicas=replica_world_size * self.accelerator.num_processes,
+    #         rank=replica_rank * self.accelerator.process_index + dist.get_rank() % self.accelerator.num_processes,
+    #         even_batches=True,
+    #     )
+    #
+    #     dataloader = DataLoader(self.train_dataset, num_workers=0, batch_sampler=batch_sampler)
+    #     print(f"num_batches remaining: {len(dataloader)}, dataset length: {len(self.train_dataset)},"
+    #           f"sampler length: {len(sampler)}, replica_world_size: {replica_world_size},"
+    #           f"replica_rank: {replica_rank}, batches_committed: {current_batches_committed}")
+    #
+    #     return dataloader
+
+    # def get_batch_samples_ft(self, epoch_iterator, num_batches, device):
+    #     if not self.ft_manager._dataloader_iter:
+    #         self.ft_manager._dataloader_dirty = True
+    #         return []
+    #     # If the recovery worker is behind the current epoch, we should skip computation and commit.
+    #     if self.ft_manager.epoch < self.ft_manager._loaded_epoch:
+    #         return None
+    #
+    #     # TODO: Here we will temporarily assume that a replica group is running on a single device.
+    #     batch_per_step = self.args.per_device_train_batch_size * self.ft_manager._replica_world_size
+    #     if self.args.total_train_batch_size % batch_per_step != 0:
+    #         logger.warning(
+    #             f"Total train batch size {self.args.total_train_batch_size} is not divisible by "
+    #             f"per step batch size {batch_per_step}. The last incomplete batch will be ignored."
+    #         )
+    #     num_batches = self.args.total_train_batch_size // batch_per_step
+    #     assert num_batches is not None, ("num_batches must be specified or "
+    #                                      "total_batch_size and batch_size must be specified")
+    #
+    #     batch_samples = []
+    #     for _ in range(num_batches):
+    #         try:
+    #             batch_samples.append(next(self.ft_manager._dataloader_iter))
+    #         except StopIteration:
+    #             break
+    #     self.ft_manager._dataloader_dirty = False
+    #     self.ft_manager._accumulation_steps = len(batch_samples)
+    #     return batch_samples if batch_samples else None
+
+    def get_num_items_in_batch(self, batch_samples, device):
+        num_items_in_batch = None
+
+        count_num_items_in_batch = (
+            len(batch_samples) > 0
+            and "labels" in batch_samples[0]
+            and (
+                # num_items_in_batch is passed to model forward
+                # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3757
+                self.model_accepts_loss_kwargs
+                # num_items_in_batch is passed to compute_loss_func
+                # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3773
+                or self.compute_loss_func is not None
+                # num_items_in_batch is also verified if (self.model_accepts_loss_kwargs or self.compute_loss_func)
+                # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3790
+            )
+        )
+
+        if count_num_items_in_batch:
+            # For now we don't support object detection
+            try:
+                num_items_in_batch = sum([(batch["labels"].ne(-100)).sum() for batch in batch_samples])
+            except (TypeError, AttributeError):
+                pass
+
+        if num_items_in_batch is not None:
+            if self.args.average_tokens_across_devices:
+                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+
+            if torch.is_tensor(num_items_in_batch):
+                num_items_in_batch = num_items_in_batch.to(device)
+
+                if self.args.n_gpu > 1 and num_items_in_batch.dim() == 0:
+                    # In the DataParallel case, convert the scalar tensor into a 1-dim tensor
+                    num_items_in_batch = num_items_in_batch.unsqueeze(0)
+
+        return num_items_in_batch
+
+    def get_dataloader_params(self, description="Training"):
+        data_collator = self.data_collator
+        if is_datasets_available() and isinstance(self.train_dataset, datasets.Dataset):
+            dataset = self._remove_unused_columns(self.train_dataset, description=description)
+        else:
+            data_collator = self._get_collator_with_removed_columns(self.data_collator, description=description)
+
+        dataloader_params = {
+            "batch_size": self._train_batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+        }
+
+        if not isinstance(dataset, torch.utils.data.IterableDataset):
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+            dataloader_params["worker_init_fn"] = partial(
+                seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+            )
+        return dataloader_params
+
+    # def get_train_dataloader_ft(self, replica_world_size=1, replica_rank=0, current_batches_committed=0):
+    #     """
+    #     Returns the training [`~torch.utils.data.DataLoader`].
+    #
+    #     Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
+    #     training if necessary) otherwise.
+    #
+    #     Subclass and override this method if you want to inject some custom behavior.
+    #     """
+    #     if self.train_dataset is None:
+    #         raise ValueError("Trainer: training requires a train_dataset.")
+    #
+    #     dataloader_params = self.get_dataloader_params(description="Training")
+    #
+    #     sampler = SkipDistributedSampler(
+    #         dataset=self.train_dataset,
+    #         num_replicas=1,
+    #         rank=0,
+    #         shuffle=True,
+    #         seed=0,
+    #         drop_last=True,
+    #         skip_samples=current_batches_committed * self.args.total_train_batch_size,
+    #     )
+    #     batch_sampler = DistributedBatchSampler(
+    #         sampler=sampler,
+    #         batch_size=self._train_batch_size,
+    #         drop_last=True,
+    #         num_replicas=replica_world_size * self.args.world_size,
+    #         rank=replica_rank * self.args.world_size + self.args.process_index % self.args.world_size,
+    #         even_batches=True,
+    #     )
+    #
+    #     dataloader = DataLoader(self.train_dataset, num_workers=0, batch_sampler=batch_sampler)
+    #     print(f"num_batches remaining: {len(dataloader)}, dataset length: {len(self.train_dataset)},"
+    #           f"sampler length: {len(sampler)}, replica_world_size: {replica_world_size},"
+    #           f"replica_rank: {replica_rank}, batches_committed: {current_batches_committed}")
+    #
+    #     return dataloader
+
+    def _inner_training_loop_ft(
+        self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
+    ):
+        self.accelerator.free_memory()
+        assert args.total_train_batch_size > 0, "Total train batch size must be greater than 0."
+        assert not self.args.auto_find_batch_size, "auto_find_batch_size should be False when using _inner_training_loop_ft"
+
+
+        self._train_batch_size = batch_size
+        dp_world_size = args.world_size // self.get_tp_size()
+        total_train_batch_size_per_replica_group = self._train_batch_size * dp_world_size
+        print(f"zcydebug: total_train_batch_size_per_replica_group={total_train_batch_size_per_replica_group}, "
+              f"_train_batch_size={self._train_batch_size}, dp_world_size={dp_world_size}, "
+              f"total_train_batch_size={args.total_train_batch_size}")
+        assert args.total_train_batch_size % total_train_batch_size_per_replica_group == 0, \
+            "Total train batch size must be divisible by total train batch size per replica group."
+        # For ft mode, self.args.gradient_accumulation_steps is the accumulation steps cross all replica group.
+        # gradient_accumulation_steps_per_group = gradient_accumulation_steps // replica world size
+        self.args.gradient_accumulation_steps = args.total_train_batch_size // total_train_batch_size_per_replica_group
+
+        logger.debug(f"Currently training with a batch size of: {self._train_batch_size}")
+        # Data loader and number of training steps
+        train_dataloader = get_train_dataloader_ft(self)
+
+        assert not self.is_fsdp_xla_v2_enabled, "FSDP XLA v2 is not supported in ft mode."
+
+        (
+            num_train_epochs,
+            num_update_steps_per_epoch,
+            num_examples,
+            num_train_samples,
+            epoch_based,
+            len_dataloader,
+            max_steps,
+        ) = self.set_initial_training_values(args, train_dataloader, args.total_train_batch_size)
+
+        num_train_tokens = None
+
+        assert not self.args.include_tokens_per_second, "include_tokens_per_second is not supported in ft mode."
+
+        if DebugOption.UNDERFLOW_OVERFLOW in self.args.debug:
+            if self.args.n_gpu > 1:
+                # nn.DataParallel(model) replicates the model, creating new variables and module
+                # references registered here no longer work on other gpus, breaking the module
+                raise ValueError(
+                    "Currently --debug underflow_overflow is not supported under DP. Please use DDP"
+                    " (torchrun or torch.distributed.launch (deprecated))."
+                )
+            else:
+                debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
+
+        delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
+
+        # Can't delay optimizer creation when using FSDP2: https://github.com/huggingface/accelerate/blob/3f636d626063ffcf9a337c7d3624d61b7d187d59/src/accelerate/accelerator.py#L1404
+        is_fsdp2 = self.is_fsdp_enabled and (getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2)
+        if is_fsdp2:
+            delay_optimizer_creation = False
+
+        # We need to reset the scheduler, as its parameters may be different on subsequent calls
+        if self._created_lr_scheduler:
+            self.lr_scheduler = None
+            self._created_lr_scheduler = False
+
+        if self.is_deepspeed_enabled:
+            self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
+
+        if not delay_optimizer_creation:
+            self.create_optimizer_and_scheduler(num_training_steps=max_steps)
+
+        self.state = TrainerState(
+            stateful_callbacks=[
+                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
+            ]
+        )
+        self.state.is_hyper_param_search = trial is not None
+        self.state.train_batch_size = self._train_batch_size
+
+        # Compute absolute values for logging, eval, and save if given as ratio
+        self.state.compute_steps(args, max_steps)
+
+        # Activate gradient checkpointing if needed
+        if args.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
+
+        model = self._wrap_model(self.model_wrapped)
+
+        # as the model is wrapped, don't use `accelerator.prepare`
+        # this is for unhandled cases such as
+        # FSDP-XLA, SageMaker MP/DP, DataParallel, IPEX
+        use_accelerator_prepare = True if model is self.model else False
+
+        if use_accelerator_prepare and self.is_fsdp_enabled:
+            # In case of auto_find_batch_size=True
+            # Remove FSDP wrapping from sub-models.
+            self.model = unwrap_model(self.model, recursive=True)
+
+        if delay_optimizer_creation:
+            if use_accelerator_prepare:
+                # configure fsdp plugin for qlora if any
+                self._fsdp_qlora_plugin_updates()
+                if self.accelerator.mixed_precision != "fp8":
+                    self.model = self.accelerator.prepare(self.model)
+            self.create_optimizer_and_scheduler(num_training_steps=max_steps)
+
+        # prepare using `accelerator` prepare
+        if use_accelerator_prepare:
+            self.model.train()
+            if hasattr(self.lr_scheduler, "step"):
+                if self.use_apex:
+                    model = self.accelerator.prepare(self.model)
+                else:
+                    model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+            else:
+                # to handle cases wherein we pass "DummyScheduler" such as when it is specified in DeepSpeed config.
+                model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+                    self.model, self.optimizer, self.lr_scheduler
+                )
+        elif self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+            # In this case we are in DDP + LOMO, which should be supported
+            self.optimizer = self.accelerator.prepare(self.optimizer)
+
+        if self.is_fsdp_enabled:
+            self.model = self.model_wrapped = model
+
+        # for the rest of this function `model` is the outside model, whether it was wrapped or not
+        if model is not self.model:
+            self.model_wrapped = model
+
+        # backward compatibility
+        if self.is_deepspeed_enabled:
+            self.deepspeed = self.model_wrapped
+
+        # ckpt loading
+        if resume_from_checkpoint is not None:
+            if self.is_deepspeed_enabled:
+                deepspeed_load_checkpoint(
+                    self.model_wrapped,
+                    resume_from_checkpoint,
+                    load_module_strict=not _is_peft_model(self.model),
+                    convert_deepspeed_universal_checkpoint=args.convert_deepspeed_universal_checkpoint,
+                )
+            elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
+                self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
+
+        # Check if saved optimizer or scheduler states exist
+        self._load_optimizer_and_scheduler(resume_from_checkpoint)
+        self._load_scaler(resume_from_checkpoint)
+
+        # important: at this point:
+        # self.model         is the Transformers Model
+        # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model),
+        # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
+
+        # Train!
+        logger.info("***** Running training *****")
+        logger.info(f"  Num examples = {num_examples:,}")
+        logger.info(f"  Num Epochs = {num_train_epochs:,}")
+        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
+        if self.args.per_device_train_batch_size != self._train_batch_size:
+            logger.info(f"  Training with DataParallel so batch size has been adjusted to: {self._train_batch_size:,}")
+        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {self.args.total_train_batch_size:,}")
+        logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+        logger.info(f"  Total optimization steps = {max_steps:,}")
+        logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
+
+        # set torchft func
+        if self.args.use_torchft:
+            self.ft_manager.register_state_dict_fn("default", self._ft_load_state_dict, self._ft_state_dict)
+
+        self.state.epoch = 0
+        start_time = time.time()
+        epochs_trained = 0
+        # steps_trained_in_current_epoch = 0
+        samples_trained_in_current_epoch = 0
+
+        # Check if continuing training from a checkpoint
+        if resume_from_checkpoint is not None and os.path.isfile(
+            os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
+        ):
+            self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+            self.compare_trainer_and_checkpoint_args(self.args, self.state)
+            self._load_callback_state()
+            if self.args.use_torchft:
+                ft_state_dict = torch.load(os.path.join(resume_from_checkpoint, TORCH_FT_STATE_NAME))
+                self.ft_manager.load_state_dict(ft_state_dict)
+            epochs_trained = self.ft_manager._loaded_epoch
+            samples_trained_in_current_epoch = self.ft_manager._loaded_current_batches_committed * self._train_batch_size
+            # steps_trained_in_current_epoch =  self.ft_manager.current_step() % (num_update_steps_per_epoch)
+            # steps_trained_in_current_epoch *= args.gradient_accumulation_steps
+
+            global_steps = self.ft_manager.current_step()
+            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
+            logger.info(f"  Continuing training from epoch {epochs_trained}")
+            logger.info(f"  Continuing training from global step {global_steps}")
+            logger.info(f"  Continuing training from samples_trained_in_current_epoch {samples_trained_in_current_epoch}")
+
+
+        # Update the references
+        for attr in ("model", "optimizer", "lr_scheduler"):
+            setattr(self.callback_handler, attr, getattr(self, attr))
+        self.callback_handler.train_dataloader = train_dataloader
+
+        self.state.init_training_references(self, max_steps, num_train_epochs, num_train_samples, trial)
+
+        # tr_loss is a tensor to avoid synchronization of TPUs through .item()
+        tr_loss = torch.tensor(0.0, device=args.device)
+        # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
+        self._total_loss_scalar = 0.0
+        self._globalstep_last_logged = self.state.global_step
+        model.zero_grad()
+        grad_norm: Optional[float] = None
+        learning_rate = None
+        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+
+        if args.eval_on_start:
+            self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
+
+        for epoch in range(epochs_trained, num_train_epochs):
+            epoch_dataloader = train_dataloader
+            if hasattr(epoch_dataloader, "set_epoch"):
+                epoch_dataloader.set_epoch(epoch)
+
+            # Reset the past mems state at the beginning of each epoch if necessary.
+            if args.past_index >= 0:
+                self._past = None
+
+            steps_in_epoch = (
+                len(epoch_dataloader)
+                if len_dataloader is not None
+                else args.max_steps * args.gradient_accumulation_steps
+            )
+            self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
+
+            if epoch == epochs_trained and resume_from_checkpoint is not None:
+                rng_to_sync = True
+            else:
+                rng_to_sync = False
+
+            steps_skipped = 0
+            step = -1
+
+            self.ft_rng_state = None
+            self.ft_rng_to_sync = False
+            last_step_skip = False
+            if self.is_deepspeed_enabled:
+                zero_optimizer = self.optimizer
+                if isinstance(zero_optimizer, DeepSpeedOptimizerWrapper):
+                    zero_optimizer = self.optimizer.optimizer
+            while (batch_samples := self.ft_manager.get_batch_samples(epoch=epoch,
+                   batch_size=self.args.train_batch_size, total_batch_size=self.args.total_train_batch_size // self.args.world_size)) is not None:
+                self.ft_manager.start_quorum()
+                if self.is_deepspeed_enabled:
+                    zero_optimizer.zero_grad()
+                num_items_in_batch = self.get_num_items_in_batch(batch_samples, args.device)
+                self.optimizer.zero_grad()
+                # # print param
+                # for params in zero_optimizer.fp16_groups:
+                #     for i, param in enumerate(params):
+                #         if dist.get_rank() == 0 and i == 100:
+                #             print(f"fp16_param = {param.ds_tensor.data[:3]}")
+
+                for i, inputs in enumerate(batch_samples):
+                    if self.is_deepspeed_enabled:
+                        assert i == zero_optimizer.micro_step_id, f"Found micro step id mismatch: {i} vs {zero_optimizer.micro_step_id}"
+                    step += 1
+                    do_sync_step = (step + 1) % args.gradient_accumulation_steps_per_replica_group == 0
+                    if not do_sync_step:
+                        do_sync_step = (step + 1) == steps_in_epoch
+
+                    # No need.
+                    # # Since we perform prefetching, we need to manually set sync_gradients
+                    # self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
+
+                    assert not self.args.include_num_input_tokens_seen, "include_num_input_tokens_seen is not supported in ft mode."
+
+                    if rng_to_sync:
+                        self._load_rng_state(resume_from_checkpoint)
+                        rng_to_sync = False
+                    if last_step_skip and self.ft_rng_state != None:
+                        rank = dist.get_rank()
+                        self._load_rng_state_from_memory(self.ft_rng_state[rank])
+
+                    if step % args.gradient_accumulation_steps_per_replica_group == 0:
+                        self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+
+                    # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
+                    # For now, only support deespeed, use null context.
+                    context = (
+                        functools.partial(self.accelerator.no_sync, model=model)
+                        if i != len(batch_samples) - 1
+                        and self.accelerator.distributed_type != DistributedType.DEEPSPEED
+                        else contextlib.nullcontext
+                    )
+
+                    with context():
+                        tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+
+                    if (
+                        args.logging_nan_inf_filter
+                        and not is_torch_xla_available()
+                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    ):
+                        # if loss is nan or inf simply add the average of previous logged losses
+                        tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                    else:
+                        if tr_loss.device != tr_loss_step.device:
+                            raise ValueError(
+                                f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
+                            )
+                        tr_loss = tr_loss + tr_loss_step
+
+                    self.current_flos += float(self.floating_point_ops(inputs))
+
+                    if do_sync_step:
+                        do_sync_step = True
+                    else:
+                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+
+                    # PyTorch/XLA relies on the data loader to insert the mark_step for
+                    # each step. Since we are breaking the loop early, we need to manually
+                    # insert the mark_step here.
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        if is_torch_xla_available():
+                            xm.mark_step()
+                        break
+
+                # We also need to break out of the nested loop
+                if self.control.should_epoch_stop or self.control.should_training_stop:
+                    if is_torch_xla_available():
+                        xm.mark_step()
+                    break
+
+                # Complete the accumulation steps then decide whether to step the optimizer
+                if self.args.use_torchft and not self.ft_manager.should_commit():
+                    print(f"Skipping step {self.ft_manager.current_step()} due to dirty.")
+                    # For deepspeed, the model may be updated in should_commit. We must wait for all model shard
+                    # to finish loading before proceeding; otherwise, inconsistencies may occur.
+                    dist.barrier()
+                    # The first call to `get_batch_samples` will return empty and mark the dataloader as dirty.
+                    # The manager server will force synchronization for `_step` being 0. If `_step` doesn't
+                    # increment here, it will cause synchronization checkpoints twice because `_step` was 0 in
+                    # the first two rounds. The second checkpoint will run in parallel with the computation,
+                    # leading to pollution. Therefore, it's necessary to avoid having `_step` 0 in two
+                    # consecutive training rounds.
+                    if self.ft_manager._step == 0:
+                        self.ft_manager._step += 1
+                        # Avoid double counting skipped steps, then got half loss.
+                        self._globalstep_last_logged += 1
+                    last_step_skip = True
+                    do_sync_step = False
+                    # zero loss for skipped step
+                    tr_loss -= tr_loss
+                else:
+                    do_sync_step = True
+
+                if do_sync_step:
+                    # Since we perform prefetching, we need to manually set sync_gradients to True
+                    self.accelerator.gradient_state._set_sync_gradients(True)
+
+                    # Gradient clipping
+                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                        if is_sagemaker_mp_enabled() and args.fp16:
+                            _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
+                        elif self.use_apex:
+                            # Revert to normal clipping otherwise, handling Apex or full precision
+                            _grad_norm = nn.utils.clip_grad_norm_(
+                                amp.master_params(self.optimizer),
+                                args.max_grad_norm,
+                            )
+                        else:
+                            _grad_norm = self.accelerator.clip_grad_norm_(
+                                model.parameters(),
+                                args.max_grad_norm,
+                            )
+
+                        if (
+                                is_accelerate_available()
+                                and self.accelerator.distributed_type == DistributedType.DEEPSPEED
+                        ):
+                            grad_norm = model.get_global_grad_norm()
+                            # In some cases the grad norm may not return a float
+                            if hasattr(grad_norm, "item"):
+                                grad_norm = grad_norm.item()
+                        else:
+                            grad_norm = _grad_norm
+
+                    if self.is_deepspeed_enabled:
+                        for sub_group_id, params in zero_optimizer.averaged_gradients.items():
+                            for i, param in enumerate(params):
+                                # if args.gradient_accumulation_steps_per_replica_group > 1:
+                                #     param.data.div_(args.gradient_accumulation_steps_per_replica_group)
+                                # if dist.get_rank() == 0:
+                                #     print(f'zcydebug: param.shape={param.data.shape}, sub_group_id={sub_group_id}, param index={i}')
+                                # if dist.get_rank() == 0 and i == 100 and sub_group_id == 0:
+                                #     print(f'zcydebug: before param={hash(param.data)}, param.data={param.data[0:3]}')
+                                if self.ft_replicate_pg.size() > 1:
+                                    dist.all_reduce(param.data, group=self.ft_replicate_pg, op=ReduceOp.AVG)
+                                # if dist.get_rank() == 0 and i == 100 and sub_group_id == 0:
+                                #     print(f'zcydebug: after param={hash(param.data)}, param.data={param.data[0:3]}')
+
+                    self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
+
+                    last_step_skip = False
+
+                    if isinstance(self.optimizer, DeepSpeedOptimizerWrapper):
+                        # For torchft and deepspeed, the optimizer step is called in the model
+                        self.optimizer.optimizer.step()
+                    else:
+                        self.optimizer.step()
+
+                    self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
+
+                    # get leaning rate before update
+                    learning_rate = self._get_learning_rate()
+
+                    if not self.accelerator.optimizer_step_was_skipped:
+                        # Delay optimizer scheduling until metrics are generated
+                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                            self.lr_scheduler.step()
+
+                    model.zero_grad()
+                    self.state.global_step = self.ft_manager.current_step()
+                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                    self._maybe_log_save_evaluate(
+                        tr_loss,
+                        grad_norm,
+                        model,
+                        trial,
+                        epoch,
+                        ignore_keys_for_eval,
+                        start_time,
+                        learning_rate=learning_rate,
+                    )
+
+            self.ft_manager.next_epoch()
+
+            if step < 0:
+                logger.warning(
+                    "There seems not to be a single sample in your epoch_iterator, stopping training at step"
+                    f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
+                    f" num_steps ({max_steps}) higher than the number of available samples."
+                )
+                self.control.should_training_stop = True
+
+            self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+            self._maybe_log_save_evaluate(
+                tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=learning_rate
+            )
+
+            if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
+                if is_torch_xla_available():
+                    # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
+                    xm.master_print(met.metrics_report())
+                else:
+                    logger.warning(
+                        "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
+                        "configured. Check your training configuration if this is unexpected."
+                    )
+            if self.control.should_training_stop:
+                break
+
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of training
+            delattr(self, "_past")
+
+        logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
+        if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
+            # Wait for everyone to get here so we are sure the model has been saved by process 0.
+            if is_torch_xla_available():
+                xm.rendezvous("load_best_model_at_end")
+            elif args.parallel_mode == ParallelMode.DISTRIBUTED:
+                dist.barrier()
+            elif is_sagemaker_mp_enabled():
+                smp.barrier()
+
+            self._load_best_model()
+
+        # add remaining tr_loss
+        self._total_loss_scalar += tr_loss.item()
+        effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
+        train_loss = self._total_loss_scalar / effective_global_step
+
+        metrics = speed_metrics(
+            "train",
+            start_time,
+            num_samples=num_train_samples,
+            num_steps=self.state.max_steps,
+            num_tokens=num_train_tokens,
+        )
+        self.store_flos()
+        metrics["total_flos"] = self.state.total_flos
+        metrics["train_loss"] = train_loss
+
+        self.is_in_train = False
+
+        self._memory_tracker.stop_and_update_metrics(metrics)
+
+        self.log(metrics)
+
+        run_dir = self._get_output_dir(trial)
+        checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
+
+        # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint and process allowed to save.
+        if self.args.should_save and self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
+            for checkpoint in checkpoints_sorted:
+                if not os.path.samefile(checkpoint, self.state.best_model_checkpoint):
+                    logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
+                    shutil.rmtree(checkpoint, ignore_errors=True)
+
+        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+
+        # Wait for the checkpoint to be uploaded.
+        self._finish_current_push()
+
+        # After training we make sure to retrieve back the original forward pass method
+        # for the embedding layer by removing the forward post hook.
+        if self.neftune_noise_alpha is not None:
+            self._deactivate_neftune(self.model)
+
+        return TrainOutput(self.state.global_step, train_loss, metrics)
+
+def get_train_dataloader_ft(self, replica_world_size=1, replica_rank=0, current_batches_committed=0):
+    assert ((self.args.gradient_accumulation_steps % replica_world_size) == 0), "Gradient accumulation steps must be divisible by replica world size."
+    self.args.gradient_accumulation_steps_per_replica_group = self.args.gradient_accumulation_steps // replica_world_size
+
+    dataloader_params = self.get_dataloader_params()
+
+    sampler = SkipDistributedSampler(
+        dataset=self.train_dataset,
+        num_replicas=1,
+        rank=0,
+        shuffle=True,
+        seed=0,
+        drop_last=True,
+        skip_samples=current_batches_committed * self.args.per_device_train_batch_size * self.accelerator.num_processes,
+    )
+    batch_sampler = DistributedBatchSampler(
+        sampler=sampler,
+        batch_size=self.args.per_device_train_batch_size,
+        drop_last=dataloader_params.get("drop_last", False),
+        num_replicas=replica_world_size * self.accelerator.num_processes,
+        rank=replica_rank * self.accelerator.num_processes + dist.get_rank() % self.accelerator.num_processes,
+        even_batches=True,
+    )
+
+    dataloader = DataLoader(self.train_dataset, num_workers=dataloader_params["num_workers"],
+                            batch_sampler=batch_sampler, collate_fn=dataloader_params["collate_fn"],
+                            pin_memory=dataloader_params["pin_memory"],
+                            persistent_workers=dataloader_params["persistent_workers"],
+                            prefetch_factor=dataloader_params.get("prefetch_factor", 2),
+                            worker_init_fn=dataloader_params.get("worker_init_fn", None))
+    print(f"num_batches remaining: {len(dataloader)}, dataset length: {len(self.train_dataset)},"
+          f"sampler length: {len(sampler)}, replica_world_size: {replica_world_size},"
+          f"replica_rank: {replica_rank}, batches_committed: {current_batches_committed}")
+
+    return dataloader
